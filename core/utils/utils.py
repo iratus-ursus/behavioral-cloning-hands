@@ -1,138 +1,182 @@
-import numpy as np
+"""
+Checkpoint utilities for TorchRL policies.
+"""
+
+from __future__ import annotations
+
 import os
-import tensorflow as tf
+import pickle
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
-#from tf_agents.networks.actor_distribution_network import ActorDistributionNetwork
-#from tf_agents.networks.actor_distribution_rnn_network import ActorDistributionRnnNetwork
-#from tf_agents.networks.value_network import ValueNetwork
-#from tf_agents.networks.value_rnn_network import ValueRnnNetwork
-#from tf_agents.agents.ppo import ppo_agent, ppo_policy
-#from tf_agents.specs import tensor_spec
-#from tf_agents.trajectories.time_step import TimeStep
-#from tf_agents.policies.policy_saver import PolicySaver
-
-
-class ObservationWrapper:
-    def __init__(self, obs_dim=(1, 30), min_obs=0, max_obs=1, normalize=False, num_agents=2):
-        self.obs_dim = obs_dim
-        self.normalize = normalize
-        self._min_obs, self._max_obs = min_obs, max_obs
-
-    def get_obs_and_step(self, frame):
-        processed_frame = self._preprocess_data(tf.squeeze(frame))  # Process frame
-
-        if self.num_frames == 1:  # Single-frame observations
-            return processed_frame
-
-        else:  # Frame stacking
-            concat = [processed_frame] + self.frames[:-1]  # New frames list
-            self.frames = concat  # Update frames
-            stacked_frames = tf.concat(tuple(concat), axis=-1)  # Concatenate
-            return stacked_frames
-
-    def _preprocess_data(self, image):
-        return [0, 0, 0]
-
-    def reset(self):
-        """ Method for resetting the observed frames. """
-        # Reset the current time step
-        if self.num_frames > 1:
-            self.frames = [tf.zeros(self.size + (self.num_channels,)) for i in
-                                    range(self.num_frames)]  # Used as queue
+import numpy as np
+import torch
+from torch import nn
 
 
 class Loader:
-    def __init__(self, dir=None, name="", time_ext="", save_interval=1):
-        dir = os.path.split(__file__)[0] if dir is None else dir
+    """
+    Save / load actor & value networks (and optional optimizer state).
 
-        self.policy_save_dir = os.path.join(dir, "models", name.format(time_ext))
+    Typical usage inside a Trainer:
+
+        self.loader = Loader(save_dir="checkpoints", name="reach_ppo")
+        ...
+        self.loader.save(
+            iteration=100,
+            actor=self.actor,
+            value=self.value,
+            optim=self.optim,
+            extra={"reward": mean_reward},
+        )
+        ...
+        ckpt = self.loader.load("checkpoints/reach_ppo/ckpt_000100.pt")
+        self.actor.load_state_dict(ckpt["actor"])
+    """
+
+    def __init__(
+        self,
+        save_dir: str = "checkpoints",
+        name: str = "policy",
+        save_interval: int = 1,
+    ):
+        self.save_dir = Path(save_dir) / name
         self.save_interval = save_interval
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Loader] Checkpoint directory: {self.save_dir}")
 
-        if not os.path.exists(self.policy_save_dir):
-            print("Directory {} does not exist;".format(self.policy_save_dir),
-                  "Creating it now...")
-            os.makedirs(self.policy_save_dir, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    def save(
+        self,
+        iteration: Union[int, str],
+        actor: Optional[nn.Module] = None,
+        value: Optional[nn.Module] = None,
+        optim: Optional[torch.optim.Optimizer] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        is_final: bool = False,
+    ) -> str:
+        """
+        Save a checkpoint.
 
-        if self.use_separate_agents:
-            # Get train and evaluation policies
-            self.train_savers = [PolicySaver(self.collect_policies[i],
-                                             batch_size=None) for i in
-                                 range(self.num_agents)]
-            self.eval_savers = [PolicySaver(self.eval_policies[i],
-                                            batch_size=None) for i in
-                                range(self.num_agents)]
-
-        else:
-            # Get train and evaluation policy savers
-            self.train_saver = PolicySaver(self.collect_policy, batch_size=None)
-            self.eval_saver = PolicySaver(self.eval_policy, batch_size=None)
-
-    def save_policies(self, epochs_done=0, is_final=False):
-        # If final, just use 'FINAL'
+        Parameters
+        ----------
+        iteration : int or str
+            Training step / epoch. If is_final=True becomes "FINAL".
+        actor, value : nn.Module
+            Networks to serialize.
+        optim : torch.optim.Optimizer, optional
+            Optimizer state.
+        extra : dict, optional
+            Any additional metadata (rewards, hyper-params, …).
+        is_final : bool
+            If True, forces the filename to contain "FINAL".
+        """
         if is_final:
-            epochs_done = "FINAL"
+            iteration = "FINAL"
 
-        # Iterate through training policies and save each of them
-        for i, train_saver in enumerate(self.train_savers):
-            if custom_path is None:
-                train_save_dir = os.path.join(self.policy_save_dir, "train",
-                                                "epochs_{}".format(epochs_done),
-                                                "agent_{}".format(i))
-            else:
-                train_save_dir = os.path.join(self.policy_save_dir, "train",
-                                                "epochs_{}".format(
-                                                    custom_path),
-                                                "agent_{}".format(i))
-            if not os.path.exists(train_save_dir):
-                os.makedirs(train_save_dir, exist_ok=True)
-            train_saver.save(train_save_dir)
+        filename = f"ckpt_{iteration:06d}.pt" if isinstance(iteration, int) else f"ckpt_{iteration}.pt"
+        path = self.save_dir / filename
 
-        print("Training policies saved...")
+        payload: Dict[str, Any] = {
+            "iteration": iteration,
+        }
+        if actor is not None:
+            payload["actor"] = actor.state_dict()
+        if value is not None:
+            payload["value"] = value.state_dict()
+        if optim is not None:
+            payload["optim"] = optim.state_dict()
+        if extra is not None:
+            payload["extra"] = extra
 
-        # Iterate through eval policies
-        for i, eval_saver in enumerate(self.eval_savers):
-            eval_save_dir = os.path.join(self.policy_save_dir, "eval",
-                                            "epochs_{}".format(epochs_done),
-                                            "agent_{}".format(i))
-            if not os.path.exists(eval_save_dir):
-                os.makedirs(eval_save_dir, exist_ok=True)
-            eval_saver.save(eval_save_dir)
+        torch.save(payload, path)
+        print(f"[Loader] Saved → {path}")
+        return str(path)
 
-        print("Eval policies saved...")
+    def save_parameters(self, params: Dict[str, Any], filename: str = "parameters.pkl") -> str:
+        """Save a plain dictionary of hyper-parameters as pickle."""
+        path = self.save_dir / filename
+        with open(path, "wb") as f:
+            pickle.dump(params, f)
+        print(f"[Loader] Parameters saved → {path}")
+        return str(path)
 
-        # Save parameters in a file
-        agent_params = {'normalize_obs': self.train_env.normalize,
-                        'use_lstm': self.use_lstm,
-                        'frame_stack': self.use_multiple_frames,
-                        'num_frame_stack': self.env.num_frame_stack,
-                        'obs_size': self.size}
+    # ------------------------------------------------------------------
+    # Load
+    # ------------------------------------------------------------------
+    def load(
+        self,
+        path: str,
+        actor: Optional[nn.Module] = None,
+        value: Optional[nn.Module] = None,
+        optim: Optional[torch.optim.Optimizer] = None,
+        device: str = "cuda:0",
+        strict: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Load a checkpoint and optionally restore networks / optimizer.
 
-        # Save as pkl parameter file
-        params_path = os.path.join(self.policy_save_dir, "parameters.pkl")
-        with open(params_path, "w") as pkl_file:
-            pickle.dump(agent_params, pkl_file)
-        pkl_file.close()
+        Returns the full checkpoint dictionary.
+        """
+        ckpt = torch.load(path, map_location=device)
+        print(f"[Loader] Loaded ← {path}")
 
-    def load_policies(self, eval_model_path=None, train_model_path=None):
-        # Load evaluation and/or training policies from path
-        if eval_model_path is not None:
-            self.eval_policy = tf.saved_model.load(eval_model_path)
-            print("Loading evaluation policy from: {}".format(eval_model_path))
+        if actor is not None and "actor" in ckpt:
+            actor.load_state_dict(ckpt["actor"], strict=strict)
+            print("[Loader] Actor weights restored")
+        if value is not None and "value" in ckpt:
+            value.load_state_dict(ckpt["value"], strict=strict)
+            print("[Loader] Value weights restored")
+        if optim is not None and "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
+            print("[Loader] Optimizer state restored")
 
-        if train_model_path is not None:
-            self.collect_policy = tf.saved_model.load(train_model_path)
-            print("Loading training policy from: {}".format(train_model_path))
+        return ckpt
+
+    def load_parameters(self, filename: str = "parameters.pkl") -> Dict[str, Any]:
+        path = self.save_dir / filename
+        with open(path, "rb") as f:
+            params = pickle.load(f)
+        print(f"[Loader] Parameters loaded ← {path}")
+        return params
+
+    def latest_checkpoint(self) -> Optional[str]:
+        """Return path to the most recent .pt file, or None."""
+        files = sorted(self.save_dir.glob("ckpt_*.pt"))
+        if not files:
+            return None
+        return str(files[-1])
 
 
-def normalize(val, current_min_val, current_max_val, new_min_val, new_max_val, clip=False):
-    val = np.array(val, dtype=float)
-    current_min_val = np.array(current_min_val, dtype=float)
-    current_max_val = np.array(current_max_val, dtype=float)
-    new_min_val = np.array(new_min_val, dtype=float)
-    new_max_val = np.array(new_max_val, dtype=float)
+# ------------------------------------------------------------------
+# Utility: value normalisation
+# ------------------------------------------------------------------
+def normalize(
+    val: np.ndarray,
+    current_min: np.ndarray,
+    current_max: np.ndarray,
+    new_min: float | np.ndarray,
+    new_max: float | np.ndarray,
+    clip: bool = False,
+) -> np.ndarray:
+    """
+    Linearly map values from [current_min, current_max] → [new_min, new_max].
+
+    Parameters
+    ----------
+    clip : bool
+        If True, clamp the result to the new range.
+    """
+    val = np.asarray(val, dtype=np.float64)
+    current_min = np.asarray(current_min, dtype=np.float64)
+    current_max = np.asarray(current_max, dtype=np.float64)
+    new_min = np.asarray(new_min, dtype=np.float64)
+    new_max = np.asarray(new_max, dtype=np.float64)
+
+    scaled = (new_max - new_min) / (current_max - current_min) * (val - current_min) + new_min
 
     if clip:
-        return np.clip((new_max_val - new_min_val) / (current_max_val - current_min_val) * (val - current_max_val) +
-                       new_max_val, new_min_val, new_max_val)
-    else:
-        return (new_max_val - new_min_val) / (current_max_val - current_min_val) * (val - current_max_val) + new_max_val
+        return np.clip(scaled, new_min, new_max)
+    return scaled

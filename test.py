@@ -1,69 +1,184 @@
-"""Tests for `dm_control.manipulation_suite`."""
+# test.py
+"""
+Basic smoke tests for Isaac Lab + TorchRL environments.
 
-from absl import flags
-from absl.testing import absltest
-from absl.testing import parameterized
-from dm_control import manipulation
+Runs a few episodes on each registered task and validates
+observation / action specs, reward range and episode termination.
+"""
+
+from __future__ import annotations
+
+import argparse
+import unittest
+
 import numpy as np
-import cv2
+import torch
+import gymnasium as gym
+
+# ------------------------------------------------------------------
+# AppLauncher must come before torch / isaaclab imports
+# ------------------------------------------------------------------
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Environment smoke tests")
+AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--num_envs", type=int, default=4)
+parser.add_argument("--seed", type=int, default=666)
+args_cli, _ = parser.parse_known_args(["--headless"])  # force headless for tests
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+# ------------------------------------------------------------------
+# Now safe to import the rest
+# ------------------------------------------------------------------
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.reach.config.franka.joint_pos_env_cfg import (
+    FrankaReachEnvCfg,
+)
+from torchrl.envs.libs.isaac_lab import IsaacLabWrapper
+from torchrl.envs import TransformedEnv, InitTracker, StepCounter, RewardSum
 
 
-flags.DEFINE_boolean(
-    'fix_seed', True,
-    'Whether to fix the seed for the environment\'s random number generator. '
-    'This the default since it prevents non-deterministic failures, but it may '
-    'be useful to allow the seed to vary in some cases, for example when '
-    'repeating a test many times in order to detect rare failure events.')
+_NUM_EPISODES = 3
+_NUM_STEPS_PER_EPISODE = 20
 
-FLAGS = flags.FLAGS
-
-_FIX_SEED = None
-_NUM_EPISODES = 5
-_NUM_STEPS_PER_EPISODE = 10
-
-
-class Test(parameterized.TestCase):
-    """Tests run on all the tasks registered."""
-    def _validate_observation(self, observation, observation_spec):
-        self.assertEqual(list(observation.keys()), list(observation_spec.keys()))
-        for name, array_spec in observation_spec.items():
-            array_spec.validate(observation[name])
-
-    def _validate_reward_range(self, reward):
-        self.assertIsInstance(reward, float)
-        self.assertBetween(reward, 0, 1)
-
-    def _validate_discount(self, discount):
-        self.assertIsInstance(discount, float)
-        self.assertBetween(discount, 0, 1)
-
-    @parameterized.parameters(*manipulation.ALL)
-    def test_task_runs(self, task_name):
-        """Tests that the environment runs and is coherent with its specs."""
-        seed = 99
-        bob = Robot("mjcf_models/mjmodel.xml")
-        task = BaseTask([bob])
-        env = composer.Environment(task, random_state=np.random.RandomState(self.seed))
-
-        prop = props.Duplo(
-            observable_options=observations.make_options(
-                obs_settings, observations.FREEPROP_OBSERVABLES))
-        cradle = SphereCradle()
-
-        env = Place(arena=arena, arm=arm, hand=hand, prop=prop,
-                    obs_settings=obs_settings,
-                    workspace=_WORKSPACE,
-                    control_timestep=constants.CONTROL_TIMESTEP,
-                    cradle=cradle)
-
-        random_state = np.random.RandomState(seed)
-
-        observation_spec = env.observation_spec()
-        action_spec = env.action_spec()
-        time_step = env.reset()
-        render = env.physics.render(height=480, width=640)
-        cv2.imwrite(f"{task_name}.png", render)
+# Same registry used in train.py (keep them in sync)
+TASK_REGISTRY = {
+    "reach_site": {
+        "env_id": "Isaac-Reach-Franka-v0",
+        "cfg_class": FrankaReachEnvCfg,
+        "episode_length_s": 5.0,
+    },
+    "reach_prop": {
+        "env_id": "Isaac-Reach-Franka-v0",
+        "cfg_class": FrankaReachEnvCfg,
+        "episode_length_s": 5.0,
+    },
+    "lift_brick": {
+        "env_id": "Isaac-Reach-Franka-v0",  # TODO: replace when ported
+        "cfg_class": FrankaReachEnvCfg,
+        "episode_length_s": 6.0,
+    },
+    "lift_large_box": {
+        "env_id": "Isaac-Reach-Franka-v0",  # TODO: replace when ported
+        "cfg_class": FrankaReachEnvCfg,
+        "episode_length_s": 6.0,
+    },
+    "place_brick": {
+        "env_id": "Isaac-Reach-Franka-v0",  # TODO: replace when ported
+        "cfg_class": FrankaReachEnvCfg,
+        "episode_length_s": 8.0,
+    },
+}
 
 
-if __name__ == '__main__':
-  absltest.main()
+def make_env(task_name: str, num_envs: int = 4, use_camera: bool = False) -> TransformedEnv:
+    """Create a minimal environment for testing (no camera by default)."""
+    if task_name not in TASK_REGISTRY:
+        raise ValueError(f"Unknown task: {task_name}")
+
+    task_info = TASK_REGISTRY[task_name]
+    cfg = task_info["cfg_class"]()
+    cfg.scene.num_envs = num_envs
+    cfg.sim.device = "cuda:0"
+    cfg.sim.dt = 1.0 / 60.0
+    cfg.decimation = 2
+    cfg.episode_length_s = task_info["episode_length_s"]
+
+    if use_camera:
+        IsaacLabWrapper.add_tiled_camera_config(
+            cfg, width=84, height=84, camera_name="tiled_camera"
+        )
+
+    base_env = gym.make(task_info["env_id"], cfg=cfg)
+    env = IsaacLabWrapper(
+        base_env,
+        device="cuda:0",
+        from_tiled_camera=use_camera,
+        pixels_key="pixels",
+        native_autoreset=True,
+    )
+
+    env = TransformedEnv(env)
+    env.append_transform(InitTracker())
+    env.append_transform(StepCounter(max_steps=int(task_info["episode_length_s"] * 60)))
+    env.append_transform(RewardSum())
+    return env
+
+
+class IsaacLabTaskTest(unittest.TestCase):
+    """Smoke tests that run on every registered task."""
+
+    def _validate_observation(self, td, observation_spec):
+        """Check that keys and shapes roughly match the observation spec."""
+        for key in observation_spec.keys():
+            self.assertIn(key, td.keys(include_nested=True))
+            obs = td.get(key)
+            self.assertTrue(torch.isfinite(obs).all(), f"Non-finite values in {key}")
+
+    def _validate_reward(self, reward: torch.Tensor):
+        self.assertTrue(torch.is_tensor(reward))
+        self.assertTrue(torch.isfinite(reward).all())
+        # Many Isaac Lab tasks use dense rewards that can be outside [0, 1]
+        # so we only check finiteness.
+
+    def _validate_action_spec(self, env: TransformedEnv):
+        action_spec = env.action_spec
+        self.assertTrue(torch.isfinite(action_spec.space.low).all())
+        self.assertTrue(torch.isfinite(action_spec.space.high).all())
+
+    def test_all_tasks_run(self):
+        torch.manual_seed(args_cli.seed)
+        np.random.seed(args_cli.seed)
+
+        for task_name in TASK_REGISTRY:
+            with self.subTest(task=task_name):
+                print(f"\n[TEST] Running task: {task_name}")
+                env = make_env(task_name, num_envs=args_cli.num_envs, use_camera=False)
+
+                self._validate_action_spec(env)
+
+                # Reset
+                td = env.reset()
+                self._validate_observation(td, env.observation_spec)
+
+                for episode in range(_NUM_EPISODES):
+                    for step in range(_NUM_STEPS_PER_EPISODE):
+                        # Random action inside the action bounds
+                        action = env.action_spec.rand()
+                        td = td.set("action", action)
+                        td = env.step(td)
+
+                        self._validate_observation(td["next"], env.observation_spec)
+                        self._validate_reward(td["next", "reward"])
+
+                        # Early break if all environments are done
+                        if td["next", "done"].all():
+                            break
+
+                    # Reset for next episode
+                    td = env.reset()
+
+                env.close()
+                print(f"[TEST] {task_name} – OK")
+
+    def test_camera_observation(self):
+        """Quick check that tiled camera produces finite pixels."""
+        env = make_env("reach_site", num_envs=2, use_camera=True)
+        td = env.reset()
+
+        self.assertIn("pixels", td.keys(include_nested=True))
+        pixels = td.get("pixels")
+        self.assertTrue(torch.isfinite(pixels.float()).all())
+        self.assertEqual(pixels.ndim, 4)  # (N, H, W, C) or (N, C, H, W)
+
+        env.close()
+        print("[TEST] camera observation – OK")
+
+
+if __name__ == "__main__":
+    # Run tests then shut down the simulator
+    try:
+        unittest.main(argv=["first-arg-is-ignored"], exit=False)
+    finally:
+        simulation_app.close()

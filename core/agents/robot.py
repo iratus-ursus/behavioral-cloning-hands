@@ -1,177 +1,230 @@
-import collections
+# robot.py
+"""
+Robot definition utilities for Isaac Lab.
+"""
 
-import numpy as np
+from __future__ import annotations
 
-from dm_control import mjcf
-from dm_control import composer
-from dm_control.composer.observation import observable
-from dm_control.mujoco import wrapper as mj_wrapper
-from dm_control.mujoco.wrapper import mjbindings
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence
 
-from config import obs
+import torch
+from isaaclab.assets import ArticulationCfg
+from isaaclab.sensors import (
+    ContactSensorCfg,
+    CameraCfg,
+    TiledCameraCfg,
+)
+from isaaclab.utils import configclass
 
 
+# ------------------------------------------------------------------
+# Default offsets / constants (kept for compatibility with old code)
+# ------------------------------------------------------------------
 ROBOT_OFFSET = (0.0, 0.0, 0.12)
-_INVALID_JOINTS_ERROR = (
-    'All non-hinge joints must have limits. Model contains the following'
-    'non-hinge joints which are unbounded:\n{invalid_str}')
 
 
-def make_robot(obs_settings):
+# ------------------------------------------------------------------
+# Observation groups that used to live in AgentObservables
+# ------------------------------------------------------------------
+@configclass
+class RobotObservationCfg:
     """
-    :param obs_settings: `observations.ObservationSettings` instance.
+    High-level description of which proprioceptive / tactile / visual
+    signals we want from the robot.
+
+    These flags are later turned into Observation terms in the
+    environment configuration.
     """
-    return Robot(observable_options=obs.make_options(obs_settings,
-                                                     obs.ROBOT_OBSERVABLES))
+
+    # Proprioception
+    joint_pos: bool = True
+    joint_vel: bool = True
+    joint_torque: bool = True
+    actuator_activation: bool = False          # "act" in MuJoCo
+
+    # Tactile
+    fingertip_contact: bool = True
+    fingerpad_contact: bool = False
+
+    # IMU-like
+    gyro: bool = False
+    accelerometer: bool = False
+
+    # Vision
+    egocentric_camera: bool = False
+    egocentric_width: int = 84
+    egocentric_height: int = 84
 
 
-class AgentObservables(composer.Observables):
-    @composer.observable
-    def joints_torque(self):
-        def get_torques(physics):
-            torques = physics.bind(self._entity.joint_torque_sensors).sensordata
-            joint_axes = physics.bind(self._entity.joints).axis
-            return np.einsum('ij,ij->i', torques.reshape(-1, 3), joint_axes)
-        return observable.Generic(get_torques)
+# ------------------------------------------------------------------
+# Helper that builds the common observation terms
+# ------------------------------------------------------------------
+def build_robot_observation_terms(
+    robot_name: str = "robot",
+    cfg: Optional[RobotObservationCfg] = None,
+) -> Dict[str, dict]:
+    """
+    Returns a dictionary that can be plugged into an Isaac Lab
+    ObservationsCfg.
 
-    @composer.observable
-    def joints_vel(self):
-        all_joints = self._entity.mjcf_model.find_all('joint')
-        return observable.MJCFFeature('qvel', all_joints)
+    Example usage inside an EnvCfg:
 
-    @composer.observable
-    def sensors_touch_fingertips(self):
-        touch_sensors = self._entity.mjcf_model.sensor.touch
-        touch_sensors = [i for i in touch_sensors if "fingertip" in i.name]
-        return observable.MJCFFeature('sensordata', touch_sensors)
+        from robots.robot import build_robot_observation_terms, RobotObservationCfg
+        obs_cfg = build_robot_observation_terms("robot", RobotObservationCfg())
+        self.observations.policy = ObservationsCfg.ObsGroupCfg(
+            terms=obs_cfg,
+            ...
+        )
+    """
+    if cfg is None:
+        cfg = RobotObservationCfg()
 
-    @composer.observable
-    def sensors_touch_fingerpads(self):
-        touch_sensors = self._entity.mjcf_model.sensor.touch
-        touch_sensors = [i for i in touch_sensors if "fingerpad" in i.name]
-        return observable.MJCFFeature('sensordata', touch_sensors)
+    terms: Dict[str, dict] = {}
 
-    @composer.observable
-    def sensors_gyro(self):
-        return observable.MJCFFeature('sensordata',
-                                      self._entity.mjcf_model.sensor.gyro)
+    if cfg.joint_pos:
+        terms["joint_pos"] = {
+            "func": "isaaclab.envs.mdp.joint_pos_rel",
+            "params": {"asset_cfg": {"name": robot_name}},
+        }
+    if cfg.joint_vel:
+        terms["joint_vel"] = {
+            "func": "isaaclab.envs.mdp.joint_vel_rel",
+            "params": {"asset_cfg": {"name": robot_name}},
+        }
+    if cfg.joint_torque:
+        # approximated via applied torque / effort
+        terms["joint_effort"] = {
+            "func": "isaaclab.envs.mdp.joint_effort",
+            "params": {"asset_cfg": {"name": robot_name}},
+        }
 
-    @composer.observable
-    def sensors_accelerometer(self):
-        return observable.MJCFFeature('sensordata',
-                                      self._entity.mjcf_model.sensor.accelerometer)
+    if cfg.fingertip_contact:
+        terms["fingertip_forces"] = {
+            "func": "isaaclab.envs.mdp.body_incoming_wrench",
+            "params": {
+                "asset_cfg": {"name": robot_name},
+                # body names must match the USD
+                "body_names": [".*fingertip.*"],
+            },
+        }
 
-    @composer.observable
-    def egocentric_camera(self):
-        options = mj_wrapper.MjvOption()
-        width, height = 8, 8
-        return observable.MJCFCamera(self._entity.egocentric_camera,
-                                     width=width, height=height, scene_option=options)
+    if cfg.egocentric_camera:
+        # Camera itself is added as a sensor; here we only declare
+        # that the observation group should include the image.
+        terms["egocentric_rgb"] = {
+            "func": "isaaclab.envs.mdp.image",
+            "params": {
+                "sensor_cfg": {"name": "egocentric_camera"},
+                "data_type": "rgb",
+            },
+        }
 
-    @composer.observable
-    def actuator_activation(self):
-        return observable.MJCFFeature('act',
-                                    self._entity.mjcf_model.find_all('actuator'))
+    return terms
+
+
+# ------------------------------------------------------------------
+# Sensor factory helpers
+# ------------------------------------------------------------------
+def make_egocentric_camera_cfg(
+    width: int = 84,
+    height: int = 84,
+    prim_path: str = "{ENV_REGEX_NS}/Robot/egocentric_camera",
+) -> TiledCameraCfg:
+    """Tiled camera attached to the robot (replaces MJCFCamera)."""
+    return TiledCameraCfg(
+        prim_path=prim_path,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.05, 0.0, 0.05),
+            rot=(0.5, -0.5, 0.5, -0.5),   # looking forward
+            convention="ros",
+        ),
+        data_types=["rgb"],
+        spawn=None,                       # camera already in USD or spawned elsewhere
+        width=width,
+        height=height,
+    )
+
+
+def make_fingertip_contact_cfg(
+    body_names: Sequence[str] = (".*fingertip.*",),
+    prim_path: str = "{ENV_REGEX_NS}/Robot",
+) -> ContactSensorCfg:
+    """Contact sensors on fingertips (replaces touch sensors)."""
+    return ContactSensorCfg(
+        prim_path=prim_path,
+        history_length=1,
+        track_air_time=False,
+        force_threshold=1.0,
+        filter_prim_paths_expr=list(body_names),
+    )
+
+
+# ------------------------------------------------------------------
+# Convenience wrappers around an Articulation
+# ------------------------------------------------------------------
+class RobotHelper:
+    """
+    Thin helper that provides the same convenience methods that the
+    old dm_control Robot class exposed (randomize joints, RSI, …).
+    Works with an already-created isaaclab Articulation.
+    """
+
+    def __init__(self, articulation, device: str = "cuda:0"):
+        self.art = articulation
+        self.device = device
 
     @property
-    def proprioception(self):
-        return [
-            self.joints_vel,
-            self.actuator_activation,
-        ] + self._collect_from_attachments('proprioception')
+    def num_joints(self) -> int:
+        return self.art.num_joints
 
+    def get_joint_limits(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (lower, upper) joint position limits."""
+        limits = self.art.data.soft_joint_pos_limits  # (N, J, 2)
+        return limits[..., 0], limits[..., 1]
 
-_GRIP_SITE = "r_gripper_palm_site"
+    def randomize_arm_joints(self, env_ids: Optional[torch.Tensor] = None) -> None:
+        """
+        Uniformly sample joint positions inside limits
+        (equivalent of old randomize_arm_joints).
+        """
+        lower, upper = self.get_joint_limits()
+        if env_ids is None:
+            n = lower.shape[0]
+            env_ids = torch.arange(n, device=self.device)
 
-class Robot(composer.Robot):
-    def _build(self, path=None, obs_settings=None):
-        if path:
-            assert path is not None, "scene_path can't be None if default_scene is False"
-            self._model = mjcf.from_path(path)
+        q = torch.empty_like(lower[env_ids])
+        q.uniform_(0.0, 1.0)
+        q = lower[env_ids] + q * (upper[env_ids] - lower[env_ids])
+        self.art.write_joint_position_to_sim(q, env_ids=env_ids)
+
+    def rsi(self, close_factors: float | Sequence[float] = 0.0,
+            env_ids: Optional[torch.Tensor] = None) -> None:
+        """
+        Reset-to-specific-pose (old rsi method).
+        close_factors ∈ [0, 1] interpolates between lower and upper limits.
+        """
+        lower, upper = self.get_joint_limits()
+        if env_ids is None:
+            n = lower.shape[0]
+            env_ids = torch.arange(n, device=self.device)
+
+        if isinstance(close_factors, (int, float)):
+            factors = torch.full(
+                (len(env_ids), self.num_joints),
+                float(close_factors),
+                device=self.device,
+            )
         else:
-            self._model = mjcf.RootElement()
+            factors = torch.as_tensor(close_factors, device=self.device)
+            factors = factors.expand(len(env_ids), -1)
 
-        self._joint_torque_sensors = [self._add_torque_sensor(joint) for joint in self.joints]
-        self.mjcf_model.actuator.motor.clear()
-
-        self._grip_site = self.mjcf_model.find('site', _GRIP_SITE)
-
-
-    def _build_observables(self):
-        return AgentObservables(self)
-
-    @property
-    def mjcf_model(self):
-        return self._model
-
-    @property
-    def joints(self):
-        """List of joint elements"""
-        return self._model.find_all('joint')
-
-    @property
-    def actuators(self):
-        return tuple(self._model.find_all('actuator'))
-
-    @property
-    def joint_torque_sensors(self):
-        return self._joint_torque_sensors
-
-    @property
-    def _hand_center_point(self):
-        return self._grip_site
-
-    def _get_joint_pos_sampling_bounds(self, physics):
-        """Returns lower and upper bounds for sampling arm joint positions.
-        Args:
-        physics: An `mjcf.Physics` instance.
-        Returns:
-        A (2, num_joints) numpy array containing (lower, upper) position bounds.
-        For hinge joints without limits the bounds are defined as [0, 2pi].
-        Raises:
-        RuntimeError: If the model contains unlimited joints that are not hinges.
-        """
-        bound_joints = physics.bind(self.joints)
-        limits = np.array(bound_joints.range, copy=True)
-        is_hinge = bound_joints.type == mjbindings.enums.mjtJoint.mjJNT_HINGE
-        is_limited = bound_joints.limited.astype(bool)
-        invalid = ~is_hinge & ~is_limited
-        if any(invalid):
-            invalid_str = '\n'.join(str(self.joints[i]) for i in np.where(invalid)[0])
-            raise RuntimeError(_INVALID_JOINTS_ERROR.format(invalid_str=invalid_str))
-        # For unlimited hinges we sample positions between 0 and 2pi.
-        limits[is_hinge & ~is_limited] = 0., 2*np.pi
-        return limits.T
-
-    def randomize_arm_joints(self, physics, random_state):
-        """Randomizes the qpos of all arm joints.
-        The ranges of qpos values is determined from the MJCF model.
-        Args:
-        physics: A `mujoco.Physics` instance.
-        random_state: An `np.random.RandomState` instance.
-        """
-        lower, upper = self._get_joint_pos_sampling_bounds(physics)
-        physics.bind(self.joints).qpos = random_state.uniform(lower, upper)
-
-    def rsi(self, physics, close_factors):
-        if not isinstance(close_factors, collections.abc.Iterable):
-            close_factors = (close_factors,) * len(self.joints)
-
-        for joint, finger_factor in zip(self.joints, close_factors):
-            joint_mj = physics.bind(joint)
-            min_value, max_value = joint_mj.range
-            joint_mj.qpos = min_value + (max_value - min_value) * finger_factor
-        physics.after_reset()
-
-        # Set target joint torque to zero.
-        physics.bind(self.actuators).ctrl = 0
-
-    def _add_torque_sensor(self, joint):
-        site = joint.parent.add(
-            'site', size=[1e-3], group=composer.SENSOR_SITES_GROUP,
-            name=joint.name+'_site')
-        return joint.root.sensor.add('torque', site=site, name=joint.name+'_torque')
-
-    @composer.cached_property
-    def egocentric_camera(self):
-        return self._model.find('camera', 'egocentric_camera')
+        q = lower[env_ids] + factors * (upper[env_ids] - lower[env_ids])
+        self.art.write_joint_position_to_sim(q, env_ids=env_ids)
+        # zero velocity & effort
+        self.art.write_joint_velocity_to_sim(
+            torch.zeros_like(q), env_ids=env_ids
+        )
+        self.art.set_joint_effort_target(
+            torch.zeros_like(q), env_ids=env_ids
+        )
