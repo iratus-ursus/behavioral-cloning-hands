@@ -13,7 +13,7 @@ from config import obs
 
 ROBOT_OFFSET = (0.0, 0.0, 0.12)
 _INVALID_JOINTS_ERROR = (
-    'All non-hinge joints must have limits. Model contains the following '
+    'All non-hinge joints must have limits. Model contains the following'
     'non-hinge joints which are unbounded:\n{invalid_str}')
 
 

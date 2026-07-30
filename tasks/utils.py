@@ -5,7 +5,7 @@ from dm_control.manipulation.shared import registry
 from dm_control.manipulation.shared import tags
 
 from config import obs
-from agents.robot import Robot
+from core.agents.robot import Robot
 from envs.arenas import CustomArena
 from tasks.move_prop import MoveProp, Prop
 from tasks.reach import Reach

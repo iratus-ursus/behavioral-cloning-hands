@@ -16,8 +16,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.client import device_lib
 
-from utility.utils import ObservationWrapper, Loader
-from utility.logger import Logger
+from core.utility.utils import ObservationWrapper, Loader
+from core.utility.logger import Logger
 
 import tf_agents
 from tf_agents.metrics import py_metrics

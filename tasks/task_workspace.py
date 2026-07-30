@@ -1,6 +1,6 @@
 import collections
 from dm_control.manipulation.shared import workspaces
-from agents import robot
+from core.agents import robot
 
 
 ###########################################################################

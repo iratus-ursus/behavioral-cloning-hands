@@ -13,7 +13,7 @@ from dm_control.manipulation.shared import constants
 from config import obs
 
 from envs.base_task import BaseTask
-from agents.robot import Robot
+from core.agents.robot import Robot
 from tasks.task_workspace import move_prop_workspace
 from tasks.utils import lift, reach, move_prop
 from envs.base_task import BaseTask

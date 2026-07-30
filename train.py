@@ -3,7 +3,7 @@ import argparse
 
 from tf_agents.environments import tf_py_environment, ObservationFilterWrapper
 
-import utility.options as options
+import core.utility.options as options
 from trainer.ppo_trainer import PPOTrainer
 from tf_agents.environments.dm_control_wrapper import DmControlWrapper
 from tf_agents.train.utils import strategy_utils
@@ -12,10 +12,10 @@ import numpy as np
 from dm_control import composer
 from dm_control.manipulation.shared import constants
 from config import obs
-from utility.wrap import MyDmControlWrapper
+from core.utility.wrap import MyDmControlWrapper
 from tf_agents.environments import wrappers
 import tf_agents
-from agents.robot import Robot
+from core.agents.robot import Robot
 
 from envs.arenas import CustomArena
 from tasks.utils import lift, reach, move_prop
