@@ -38,95 +38,25 @@ class ImageLayer(tf.keras.layers.Layer):
 
 
 def make_networks(env,
-                  strategy,
                   actor_net_layer,
                   value_net_layer,
-                  lstm_size,
-                  dropout_layer_params,
-                  use_cnn):
+                  dropout_layer_params):
     obs_spec, act_spec, ts_spec = spec_utils.get_tensor_specs(env)
 
-    if use_cnn:
-        with strategy.scope():
-            preprocessing_layers = {
-                'front_close': tf.keras.models.Sequential([
-                    tf.keras.layers.Reshape((84, 84, 3)),
-                    tf.keras.layers.Rescaling(scale=1/255.0),
-                    tf.keras.layers.Conv2D(32, (3, 3), activation='relu'),
-                    tf.keras.layers.MaxPooling2D((2, 2)),
-                    tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-                    tf.keras.layers.MaxPooling2D((2, 2)),
-                    tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-                    tf.keras.layers.Flatten(),
-                    tf.keras.layers.Dense(64, activation='relu')
-                ]),
-                'jaco_arm/joints_pos': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/joints_torque': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/joints_vel': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/jaco_hand/joints_pos': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/jaco_hand/joints_vel': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/jaco_hand/pinch_site_pos': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-                'jaco_arm/jaco_hand/pinch_site_rmat': tf.keras.models.Sequential([tf.keras.layers.Flatten()]),
-            }
-
-            preprocessing_combiner = tf.keras.layers.Concatenate(axis=-1)
-
-            actor_net = ActorDistributionRnnNetwork(obs_spec,
-                                                    act_spec,
-                                                    preprocessing_layers=preprocessing_layers,
-                                                    preprocessing_combiner=preprocessing_combiner,
-                                                    input_fc_layer_params=actor_net_layer,
-                                                    lstm_size=lstm_size,
-                                                    output_fc_layer_params=(128,),
-            )
-            value_net = ValueRnnNetwork(obs_spec,
-                                        preprocessing_layers=preprocessing_layers,
-                                        preprocessing_combiner=preprocessing_combiner,
-                                        input_fc_layer_params=value_net_layer,
-                                        lstm_size=lstm_size,
-                                        output_fc_layer_params=(128,),
-            )
-    else:
-        actor_net = ActorDistributionNetwork(obs_spec,
-                                            act_spec,
-                                            fc_layer_params=actor_net_layer,
-        )
-        value_net = ValueNetwork(obs_spec,
-                                    fc_layer_params=value_net_layer,
-        )
+    actor_net = ActorDistributionNetwork(obs_spec,
+                                        act_spec,
+                                        fc_layer_params=actor_net_layer,
+    )
+    value_net = ValueNetwork(obs_spec,
+                                fc_layer_params=value_net_layer,
+    )
     return actor_net, value_net
-
-        # preprocessing_layers = {
-        #     'MuJoCo Model/egocentric_camera': tf.keras.models.Sequential([tf.keras.layers.Flatten(),
-        #                                                                 tf.keras.layers.Dense(10),
-        #                                                                 tf.keras.layers.Flatten()]),
-        #     'MuJoCo Model/joints_torque': tf.keras.models.Sequential([tf.keras.layers.Dense(10),
-        #                                                                 tf.keras.layers.Flatten()]),
-        #     'MuJoCo Model/joints_vel': tf.keras.models.Sequential([tf.keras.layers.Dense(10),
-        #                                                             tf.keras.layers.Flatten()]),
-        #     'MuJoCo Model/sensors_touch_fingerpads': tf.keras.models.Sequential([tf.keras.layers.Dense(10),
-        #                                                                             tf.keras.layers.Flatten()]),
-        #     'MuJoCo Model/sensors_touch_fingertips': tf.keras.models.Sequential([tf.keras.layers.Dense(10),
-        #                                                                             tf.keras.layers.Flatten()]),
-
-        #     'unnamed_model/angular_velocity': tf.keras.models.Sequential([tf.keras.layers.Dense(1),
-        #                                                                     tf.keras.layers.Flatten()]),
-        #     'unnamed_model/linear_velocity': tf.keras.models.Sequential([tf.keras.layers.Dense(1),
-        #                                                                 tf.keras.layers.Flatten()]),
-        #     'unnamed_model/orientation': tf.keras.models.Sequential([tf.keras.layers.Dense(1),
-        #                                                             tf.keras.layers.Flatten()]),
-        #     'unnamed_model/position': tf.keras.models.Sequential([tf.keras.layers.Dense(1),
-        #                                                         tf.keras.layers.Flatten()]),
-        # }
-
 
 def make_agent(env,
                strategy,
                actor_net,
                critic_net,
-               lr=4e-4,
-               dropout_layer_params=(0.15,0.15),
-               use_cnn=True):
+               lr=4e-4):
     # Now create the agent using the actor and critic networks
     obs_spec, act_spec, ts_spec = spec_utils.get_tensor_specs(env)
 
